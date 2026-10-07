@@ -1,0 +1,22 @@
+# SandboxAgent — one-command web dashboard.
+#
+#   docker compose up
+#
+# then open http://localhost:8000. Ollama runs on the HOST, not in this
+# container — on Docker Desktop, host.docker.internal points at it.
+services:
+  sandbox-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Where the container finds Ollama. On Linux use --network host
+      # (see README) or replace with your host's LAN IP.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      # Uncomment to pin a different tool-capable model:
+      # - SANDBOX_AGENT_MODEL=llama3.1
+    # Persist agent working files and session logs across restarts:
+    # volumes:
+    #   - ./work:/app/work
+    #   - ./logs:/app/logs
+    restart: unless-stopped

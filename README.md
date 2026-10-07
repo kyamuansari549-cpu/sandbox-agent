@@ -17,12 +17,28 @@ safety gate asks your permission before anything risky.
   `python:3.12-slim` container: no network, only one host folder visible,
   container deleted after each command
 - **3-tier safety gate** — catastrophic commands are blocked outright,
-  risky ones ask for your approval, safe ones just run
+  risky ones ask for your approval, safe ones just run. On the web
+  dashboard, risky commands pause the agent and pop up an Approve / Deny
+  dialog instead of asking on the terminal
+- **Live streaming dashboard** — the agent's thinking, tool calls and
+  answer tokens stream to the browser over SSE as they happen, with a
+  Stop button to cancel a run mid-flight
+- **Model picker** — switch the Ollama model from the dashboard header
+  (per chat session); the backend lists what's installed via `/api/models`
+- **File downloads** — files the agent creates in its workspace can be
+  downloaded straight from the dashboard (path-traversal protected)
+- **Scheduled tasks** — "run this prompt every N minutes": persisted in
+  `scheduled_tasks.json`, executed by a background scheduler, past runs
+  visible in the dashboard's Scheduled view
+- **Token usage** — prompt/completion tokens captured per LLM call from
+  Ollama's eval counts; shown per turn and as session totals
 - **Dry-run mode** — preview what the agent *would* do without executing
   anything
 - **Session logs** — every tool call of every run is saved to `logs/`
 - **Web tools** — DuckDuckGo search + page fetching, stdlib-only, no API
   keys needed
+- **MCP support** — plug in external tools via the Model Context Protocol
+  (stdio); each server's tools appear as `mcp__<server>__<tool>`
 - **Graceful degradation** — no Docker? No Ollama? You get a clear message,
   never a traceback
 
@@ -90,6 +106,30 @@ streams progress with Server-Sent Events.
 *For UI development only:* `cd web && npm install && npm run dev`
 (needs Node 20.19+), then `npm run build` to refresh `web/dist/`.
 
+## Run with Docker
+
+```
+docker build -t sandbox-agent .
+docker run -p 8000:8000 -e OLLAMA_HOST=http://host.docker.internal:11434 sandbox-agent
+```
+
+Or with compose: `docker compose up` (reads the same `OLLAMA_HOST` env var).
+Then open **http://localhost:8000**.
+
+**Ollama connectivity** — Ollama runs on the HOST, not in the container,
+so `http://localhost:11434` inside the container won't reach it:
+
+- **Linux:** run with `--network host` and `OLLAMA_HOST=http://localhost:11434`
+  (or keep the default bridge network and point `OLLAMA_HOST` at your host's
+  LAN IP).
+- **Windows / Mac (Docker Desktop):**
+  `OLLAMA_HOST=http://host.docker.internal:11434`.
+
+**Sandbox note:** the agent's Docker-in-Docker command sandbox needs the
+Docker socket. Without it, `run_command` inside the container falls back to
+host execution with a warning. To keep the sandbox: add
+`-v /var/run/docker.sock:/var/run/docker.sock` (advanced, optional).
+
 ## How it works
 
 ```
@@ -126,8 +166,10 @@ sandbox-agent/
 ├── safety.py         # denylist / approval gate for run_command
 ├── session.py        # append-only session logging to logs/
 ├── config.py         # all settings, overridable via env vars (see below)
+├── mcp_client.py     # minimal MCP stdio client (JSON-RPC 2.0 over NDJSON)
+├── mcp_tools.py      # MCP discovery + dispatch: schemas named mcp__<server>__<tool>
 ├── requirements.txt  # requests, pytest
-├── examples/         # try-me task prompts (01-explore-project.md, …)
+├── examples/         # try-me task prompts (01-explore-project.md, …) + mcp_echo_server.py
 ├── work/             # the ONLY host dir mounted into the sandbox (/work)
 ├── logs/             # per-run session logs (created automatically)
 ├── tests/            # pytest suite — all external calls mocked
@@ -149,6 +191,7 @@ sandbox-agent/
 | `SANDBOX_AGENT_SANDBOX_ENABLED` | `true` | `false` → always run commands on the host, no Docker attempt |
 | `SANDBOX_AGENT_SAFETY` | `true` | `false` → skip the safety gate entirely (not recommended) |
 | `SANDBOX_AGENT_DRY_RUN` | `false` | `true` → report what *would* run, execute nothing |
+| `MCP_SERVERS` | `[]` | JSON list of MCP servers: `[{"name":…, "command":…, "args":[…]}`; see [MCP](#mcp-model-context-protocol) |
 
 ## Sandbox (Docker)
 
@@ -238,6 +281,37 @@ No API keys needed. Parsing is stdlib-only (`html.parser` + regex).
 > non-HTML content like PDFs) comes back as a plain `ERROR: ...` tool
 > result.
 
+## MCP (Model Context Protocol)
+
+The [Model Context Protocol](https://modelcontextprotocol.io) is an open
+standard for giving AI agents extra tools: any program that speaks MCP over
+stdio (newline-delimited JSON-RPC 2.0) can be plugged in, and every tool it
+exposes becomes a tool the agent can call. No API keys, no new code in the
+agent — just a subprocess.
+
+Configure servers with the `MCP_SERVERS` env var — a JSON list of
+`{"name", "command", "args"}` entries. Each entry spawns one subprocess:
+
+```
+MCP_SERVERS='[{"name":"echo","command":"python","args":["examples/mcp_echo_server.py"]}]' \
+  python agent.py "echo the word hello using the echo tool"
+```
+
+Each server tool appears to the model as `mcp__<server>__<tool>` — e.g.
+`mcp__echo__echo` — with the description and JSON input schema the server
+itself advertised (`tools/list`). `examples/mcp_echo_server.py` is a tiny
+stdlib-only example server (one tool, `echo`, that echoes its input) you
+can copy as a starting point. Paths in `args` are resolved relative to the
+directory you launch `agent.py` from — use absolute paths if in doubt.
+
+**Graceful degradation:** with no servers configured, `mcp_schemas()`
+returns `[]` immediately (nothing is spawned) and the agent behaves exactly
+as before. A server that fails to start, hangs, or crashes is skipped with
+a one-line stderr warning (`sandbox-agent: MCP server '<name>'
+unavailable: …`); the other servers — and the built-in tools — keep
+working. Tool failures, like every other tool, come back as plain
+`ERROR: …` text the model can read.
+
 ## Honest limitations
 
 - The safety denylist is pattern matching — it stops accidents, not a
@@ -270,7 +344,7 @@ pip install -r requirements.txt
 python -m pytest tests/ -q
 ```
 
-69 tests, all external calls mocked (Ollama, Docker, HTTP) — no model,
+119 tests, all external calls mocked (Ollama, Docker, HTTP) — no model,
 container, or network needed to run them.
 
 See `ARCHITECTURE.md` for the full design doc, the safety model, and the

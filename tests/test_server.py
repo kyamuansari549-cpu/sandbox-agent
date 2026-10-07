@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,11 +32,16 @@ def _client():
     return TestClient(server_mod.app)
 
 
+def _session_id(events):
+    """session_id from the "session" handshake event (now the 2nd event)."""
+    return next(e for e in events if e["type"] == "session")["session_id"]
+
+
 def _one_tool_then_answer(monkeypatch, path):
     """llm.chat: first turn calls list_dir, second turn answers."""
     seen = {"n": 0, "messages": None}
 
-    def fake_chat(messages, tools):
+    def fake_chat(messages, tools, **kw):
         seen["n"] += 1
         if seen["n"] == 1:
             return {
@@ -70,9 +76,11 @@ def test_chat_streams_full_event_sequence(monkeypatch, tmp_path):
     events = _parse_sse(resp.text)
     types = [e["type"] for e in events]
 
-    # session handshake is the FIRST event on a fresh chat
-    assert types[0] == "session"
-    assert events[0]["session_id"]
+    # run handshake is the FIRST event; session handshake comes second
+    assert types[0] == "run"
+    assert events[0]["run_id"]
+    assert types[1] == "session"
+    assert events[1]["session_id"]
     # the core loop events are all present, in order
     assert "tool_call" in types and "tool_result" in types and "answer" in types
     assert types.index("tool_call") < types.index("tool_result")
@@ -101,8 +109,9 @@ def test_unknown_session_id_creates_new_session(monkeypatch, tmp_path):
         "/api/chat", json={"message": "hi", "session_id": "does-not-exist"}
     )
     events = _parse_sse(resp.text)
-    assert events[0]["type"] == "session"
-    new_id = events[0]["session_id"]
+    assert events[0]["type"] == "run"
+    assert events[1]["type"] == "session"
+    new_id = events[1]["session_id"]
     assert new_id != "does-not-exist"
     assert new_id in server_mod._sessions
 
@@ -113,9 +122,9 @@ def test_multiturn_reuses_session_messages(monkeypatch, tmp_path):
     seen = _one_tool_then_answer(monkeypatch, tmp_path)
     client = _client()
 
-    sid = _parse_sse(
+    sid = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "list my files"}).text
-    )[0]["session_id"]
+    ))
     history_len = len(server_mod._sessions[sid]["messages"])
 
     # Second turn: llm sees the SAME messages list, now longer (prior turn kept)
@@ -129,7 +138,7 @@ def test_multiturn_reuses_session_messages(monkeypatch, tmp_path):
 
 def test_ollama_down_yields_error_event_not_crash(monkeypatch):
     """llm.chat raising RuntimeError becomes an error event; stream ends done."""
-    def fake_chat(messages, tools):
+    def fake_chat(messages, tools, **kw):
         raise RuntimeError("Cannot reach Ollama at http://localhost:11434.")
 
     monkeypatch.setattr(llm_mod, "chat", fake_chat)
@@ -163,9 +172,9 @@ def test_sessions_list_after_chat(monkeypatch, tmp_path):
     client = _client()
 
     long_msg = "list my files please, this message is deliberately longer than sixty characters"
-    sid = _parse_sse(
+    sid = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": long_msg}).text
-    )[0]["session_id"]
+    ))
 
     items = client.get("/api/sessions").json()
     assert len(items) == 1
@@ -182,12 +191,12 @@ def test_sessions_list_newest_first(monkeypatch, tmp_path):
     _one_tool_then_answer(monkeypatch, tmp_path)
     client = _client()
 
-    sid1 = _parse_sse(
+    sid1 = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "first chat"}).text
-    )[0]["session_id"]
-    sid2 = _parse_sse(
+    ))
+    sid2 = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "second chat"}).text
-    )[0]["session_id"]
+    ))
 
     items = client.get("/api/sessions").json()
     assert len(items) == 2
@@ -201,9 +210,9 @@ def test_session_history_returns_display_turns(monkeypatch, tmp_path):
     _one_tool_then_answer(monkeypatch, tmp_path)
     client = _client()
 
-    sid = _parse_sse(
+    sid = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "list my files"}).text
-    )[0]["session_id"]
+    ))
 
     resp = client.get(f"/api/sessions/{sid}")
     assert resp.status_code == 200
@@ -243,9 +252,9 @@ def test_multiturn_accumulates_display_turns(monkeypatch, tmp_path):
     _one_tool_then_answer(monkeypatch, tmp_path)
     client = _client()
 
-    sid = _parse_sse(
+    sid = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "first question"}).text
-    )[0]["session_id"]
+    ))
     client.post("/api/chat", json={"message": "second question", "session_id": sid})
 
     display = client.get(f"/api/sessions/{sid}").json()["display"]
@@ -262,18 +271,237 @@ def test_multiturn_accumulates_display_turns(monkeypatch, tmp_path):
 
 def test_error_turn_still_recorded_in_display(monkeypatch):
     """An Ollama failure records the error text as the assistant turn."""
-    def fake_chat(messages, tools):
+    def fake_chat(messages, tools, **kw):
         raise RuntimeError("Cannot reach Ollama at http://localhost:11434.")
 
     monkeypatch.setattr(llm_mod, "chat", fake_chat)
     client = _client()
 
-    sid = _parse_sse(
+    sid = _session_id(_parse_sse(
         client.post("/api/chat", json={"message": "hi there"}).text
-    )[0]["session_id"]
+    ))
 
     display = client.get(f"/api/sessions/{sid}").json()["display"]
     assert len(display) == 2
     assert display[0]["role"] == "user"
     assert display[1]["role"] == "assistant"
     assert "Ollama" in display[1]["content"]
+
+
+# --------------------------------------------------------------------------
+# New contract: download endpoint, run lifecycle, models, usage in done.
+
+
+def test_download_guards(monkeypatch, tmp_path):
+    """download: absolute -> 400, traversal -> 403, missing -> 404, legit -> 200."""
+    monkeypatch.setattr(server_mod.config, "SANDBOX_WORKDIR", str(tmp_path))
+    client = _client()
+
+    assert (
+        client.get("/api/download", params={"path": "/etc/passwd"}).status_code
+        == 400
+    )
+    assert (
+        client.get("/api/download", params={"path": "../../etc/passwd"}).status_code
+        == 403
+    )
+    assert (
+        client.get("/api/download", params={"path": "nope.txt"}).status_code == 404
+    )
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "note.txt").write_text("hello-download")
+    resp = client.get("/api/download", params={"path": "sub/note.txt"})
+    assert resp.status_code == 200
+    assert resp.content == b"hello-download"
+
+
+def test_done_event_carries_usage_run_id_and_model(monkeypatch):
+    """done is last and carries run_id, usage totals, stopped, model."""
+
+    def fake_chat(messages, tools, **kw):
+        return {
+            "role": "assistant",
+            "content": "hi there",
+            "_usage": {"prompt_tokens": 10, "completion_tokens": 4},
+        }
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    client = _client()
+    events = _parse_sse(client.post("/api/chat", json={"message": "hi"}).text)
+
+    assert events[0]["type"] == "run"
+    run_id = events[0]["run_id"]
+    assert run_id
+
+    usage_ev = next(e for e in events if e["type"] == "usage")
+    assert (usage_ev["prompt_tokens"], usage_ev["completion_tokens"]) == (10, 4)
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["run_id"] == run_id
+    assert done["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 4,
+        "total_tokens": 14,
+    }
+    assert done["stopped"] is False
+    assert done["model"] == server_mod.config.MODEL
+
+    assert run_id not in server_mod._runs  # unregistered when stream finished
+
+    sid = _session_id(events)
+    display = client.get(f"/api/sessions/{sid}").json()["display"]
+    assert display[1]["usage"] == {"prompt_tokens": 10, "completion_tokens": 4}
+    assert display[1]["model"] == server_mod.config.MODEL
+
+
+def test_chat_model_override_persists_on_session(monkeypatch):
+    """model= in the request is used and sticks to the session."""
+
+    def fake_chat(messages, tools, **kw):
+        seen["model"] = kw.get("model")
+        return {"role": "assistant", "content": "ok"}
+
+    seen = {}
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    client = _client()
+
+    events = _parse_sse(
+        client.post("/api/chat", json={"message": "hi", "model": "llama3.1:8b"}).text
+    )
+    assert seen["model"] == "llama3.1:8b"
+    assert events[-1]["model"] == "llama3.1:8b"
+
+    # second turn without a model keeps the session's model
+    sid = _session_id(events)
+    seen.clear()
+    client.post("/api/chat", json={"message": "again", "session_id": sid})
+    assert seen["model"] == "llama3.1:8b"
+
+
+def _register_test_run(run_id, approval_event=None):
+    with server_mod._runs_lock:
+        server_mod._runs[run_id] = {
+            "cancel": threading.Event(),
+            "approval_event": approval_event,
+            "approval_decision": None,
+            "session_id": "s",
+        }
+
+
+def _unregister_test_run(run_id):
+    with server_mod._runs_lock:
+        server_mod._runs.pop(run_id, None)
+
+
+def test_stop_unknown_run_404():
+    client = _client()
+    assert client.post("/api/runs/does-not-exist/stop").status_code == 404
+
+
+def test_stop_known_run_sets_cancel():
+    client = _client()
+    run_id = "test-run-stop"
+    _register_test_run(run_id)
+    try:
+        resp = client.post(f"/api/runs/{run_id}/stop")
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert server_mod._runs[run_id]["cancel"].is_set()
+    finally:
+        _unregister_test_run(run_id)
+
+
+def test_approve_unknown_run_404():
+    client = _client()
+    resp = client.post("/api/runs/nope/approve", json={"decision": "approve"})
+    assert resp.status_code == 404
+
+
+def test_approve_bad_decision_400():
+    client = _client()
+    run_id = "test-run-approve-400"
+    _register_test_run(run_id, approval_event=threading.Event())
+    try:
+        resp = client.post(f"/api/runs/{run_id}/approve", json={"decision": "maybe"})
+        assert resp.status_code == 400
+    finally:
+        _unregister_test_run(run_id)
+
+
+def test_approve_no_pending_409():
+    client = _client()
+    run_id = "test-run-approve-409"
+    # no gate created yet
+    _register_test_run(run_id)
+    try:
+        resp = client.post(f"/api/runs/{run_id}/approve", json={"decision": "deny"})
+        assert resp.status_code == 409
+    finally:
+        _unregister_test_run(run_id)
+    # gate already resolved
+    gate = threading.Event()
+    gate.set()
+    _register_test_run(run_id, approval_event=gate)
+    try:
+        resp = client.post(f"/api/runs/{run_id}/approve", json={"decision": "deny"})
+        assert resp.status_code == 409
+    finally:
+        _unregister_test_run(run_id)
+
+
+def test_approve_happy_path():
+    client = _client()
+    run_id = "test-run-approve-ok"
+    gate = threading.Event()
+    _register_test_run(run_id, approval_event=gate)
+    try:
+        resp = client.post(f"/api/runs/{run_id}/approve", json={"decision": "deny"})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+        assert gate.is_set()
+        assert server_mod._runs[run_id]["approval_decision"] == "deny"
+    finally:
+        _unregister_test_run(run_id)
+
+
+def test_models_endpoint_proxies_ollama(monkeypatch):
+    """GET /api/models lists Ollama's tags, default from config."""
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"models": [{"name": "qwen2.5:7b"}, {"name": "llama3.1:8b"}, {}]}
+
+    class FakeRequests:
+        @staticmethod
+        def get(url, timeout=None):
+            assert url.endswith("/api/tags")
+            assert timeout == 5
+            return FakeResp()
+
+    monkeypatch.setattr(server_mod, "requests", FakeRequests())
+    client = _client()
+    body = client.get("/api/models").json()
+    assert body == {
+        "models": ["qwen2.5:7b", "llama3.1:8b"],
+        "default": server_mod.config.MODEL,
+    }
+
+
+def test_models_endpoint_falls_back_on_failure(monkeypatch):
+    """Any Ollama failure -> empty list, default still set."""
+
+    class FakeRequests:
+        @staticmethod
+        def get(url, timeout=None):
+            raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(server_mod, "requests", FakeRequests())
+    client = _client()
+    body = client.get("/api/models").json()
+    assert body == {"models": [], "default": server_mod.config.MODEL}

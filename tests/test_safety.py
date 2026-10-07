@@ -248,7 +248,7 @@ def test_broken_logging_does_not_break_agent_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(session_mod, "LOG_DIR", str(blocker / "logs"))
     monkeypatch.setattr(session_mod, "_session_file", None)
 
-    def fake_chat(messages, tools):
+    def fake_chat(messages, tools, **kw):
         if not any(m.get("role") == "tool" for m in messages):
             return {
                 "role": "assistant",

@@ -1,5 +1,6 @@
 """Configuration for SandboxAgent. Every value is overridable via env vars."""
 
+import json
 import os
 
 # Where Ollama serves its API.
@@ -48,3 +49,21 @@ SAFETY_ENABLED = _env_bool("SANDBOX_AGENT_SAFETY", True)
 # execute without executing anything — handy for seeing what the agent
 # would do. Env: SANDBOX_AGENT_DRY_RUN=true
 DRY_RUN = _env_bool("SANDBOX_AGENT_DRY_RUN", False)
+
+
+def _env_json(name, default):
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+# MCP (Model Context Protocol) servers: JSON list of
+# {"name": str, "command": str, "args": [str]}. Each entry spawns a stdio
+# MCP server subprocess; every tool it exposes becomes an agent tool named
+# mcp__<name>__<tool>. Env: MCP_SERVERS
+# Example: MCP_SERVERS='[{"name":"echo","command":"python","args":["examples/mcp_echo_server.py"]}]'
+MCP_SERVERS = _env_json("MCP_SERVERS", [])

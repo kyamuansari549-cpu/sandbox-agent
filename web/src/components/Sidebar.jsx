@@ -17,9 +17,18 @@ export default function Sidebar({
   activeId,
   onSelect,
   onNewChat,
-  model,
+  view,
+  onViewChange,
+  models,
+  modelsLoaded,
+  selectedModel,
+  defaultModel,
+  onModelChange,
   connected,
 }) {
+  const options = models && models.length > 0 ? models : [defaultModel];
+  const offline = modelsLoaded && (!models || models.length === 0);
+
   return (
     <aside className="sidebar">
       <div className="side-brand">
@@ -35,6 +44,21 @@ export default function Sidebar({
             +
           </span>
           New chat
+        </button>
+      </div>
+
+      <div className="view-tabs" role="tablist" aria-label="Main view">
+        <button
+          className={`view-tab${view === "chat" ? " active" : ""}`}
+          onClick={() => onViewChange("chat")}
+        >
+          Chat
+        </button>
+        <button
+          className={`view-tab${view === "tasks" ? " active" : ""}`}
+          onClick={() => onViewChange("tasks")}
+        >
+          Scheduled
         </button>
       </div>
 
@@ -69,7 +93,22 @@ export default function Sidebar({
       </div>
 
       <div className="side-footer">
-        {model && <span className="model-badge">{model}</span>}
+        <div className="model-picker">
+          <select
+            className="model-select"
+            value={selectedModel}
+            onChange={(e) => onModelChange(e.target.value)}
+            title="Ollama model for new agent runs"
+            aria-label="Model"
+          >
+            {options.map((m) => (
+              <option key={m} value={m}>
+                {m === selectedModel ? `✓ ${m}` : m}
+              </option>
+            ))}
+          </select>
+          {offline && <span className="offline-hint">(Ollama offline)</span>}
+        </div>
         <span className={`conn ${connected ? "ok" : "bad"}`}>
           <span className="dot" />
           {connected ? "Connected" : "Disconnected"}

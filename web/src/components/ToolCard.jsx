@@ -1,12 +1,14 @@
 import { useState } from "react";
+import { downloadUrl } from "../api.js";
 
+/* Single-glyph tool markers (no emoji). */
 const TOOL_ICONS = {
-  run_command: "⚙️",
-  read_file: "📄",
-  write_file: "📝",
-  list_dir: "📁",
-  fetch_url: "🌐",
-  web_search: "🔎",
+  run_command: "»",
+  read_file: "r",
+  write_file: "w",
+  list_dir: "d",
+  fetch_url: "u",
+  web_search: "?",
 };
 
 const MAX_SUMMARY = 90;
@@ -45,11 +47,15 @@ export default function ToolCard({ step }) {
   const [showArgs, setShowArgs] = useState(false);
   const [showOutput, setShowOutput] = useState(false);
 
-  const icon = TOOL_ICONS[step.name] || "🔧";
+  const icon = TOOL_ICONS[step.name] || "t";
   const summary = argSummary(step.name, step.args);
   const hasOutput = step.result != null && step.result !== "";
   const outputTruncated =
     hasOutput && step.result.length > MAX_OUTPUT_PREVIEW;
+  const filePath =
+    step.name === "write_file" && step.args && step.args.path
+      ? String(step.args.path)
+      : null;
 
   return (
     <div className="tool-card">
@@ -70,7 +76,11 @@ export default function ToolCard({ step }) {
         </pre>
       )}
 
-      {hasOutput ? (
+      {step.awaitingApproval ? (
+        <div className="tool-pending approval-wait">
+          <span className="spinner sm" /> Waiting for your approval…
+        </div>
+      ) : hasOutput ? (
         <>
           <button
             className="tool-out-toggle"
@@ -91,6 +101,20 @@ export default function ToolCard({ step }) {
       ) : (
         <div className="tool-pending">
           <span className="spinner sm" /> running…
+        </div>
+      )}
+
+      {filePath && (
+        <div className="tool-actions">
+          <a
+            className="tool-download"
+            href={downloadUrl(filePath)}
+            target="_blank"
+            rel="noreferrer"
+            download
+          >
+            Download file
+          </a>
         </div>
       )}
     </div>

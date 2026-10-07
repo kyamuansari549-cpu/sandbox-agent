@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+work/
+scheduled_tasks.json
+web/node_modules/
+.git/
+.venv/
+*.log

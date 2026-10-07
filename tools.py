@@ -3,8 +3,14 @@
 Contract: tools NEVER raise into the agent loop. Any failure — bad path,
 timeout, crashed command — comes back as an "ERROR: ..." string so the LLM
 can read it and recover.
+
+The one exception is ApprovalNeeded, raised by run_command when a risky
+command needs human approval and the caller is the web UI (web_mode is
+True). The agent loop catches it, pauses for the approval dialog, and
+either re-runs with _approved=True or records a cancellation.
 """
 
+import contextvars
 import os
 import subprocess
 
@@ -12,6 +18,25 @@ import config
 import safety
 import sandbox
 from webtools import fetch_url, web_search
+
+
+class ApprovalNeeded(Exception):
+    """Raised by run_command when web_mode is on and a command needs approval.
+
+    Carries the command and the safety reason so the agent loop can ask
+    the user through the web UI instead of the stdin prompt.
+    """
+
+    def __init__(self, command, reason):
+        super().__init__(reason)
+        self.command = command
+        self.reason = reason
+
+
+# True while the web agent loop is running: risky commands raise
+# ApprovalNeeded instead of prompting on stdin. Set by agent.stream_agent
+# (per run, via try/finally); False everywhere else (CLI, scheduled runs).
+web_mode = contextvars.ContextVar("sandbox_web_mode", default=False)
 
 # Prefixed to run_command's result when Docker is missing and the command
 # ran on the host instead of inside the sandbox.
@@ -48,7 +73,7 @@ def _run_on_host(command, timeout):
     return _format_result(out, proc.returncode)
 
 
-def run_command(command, timeout=None):
+def run_command(command, timeout=None, _approved=False):
     """Run a shell command; return stdout+stderr (truncated) and exit code.
 
     Phase 2: prefers the Docker sandbox. If Docker is unavailable, falls
@@ -59,6 +84,12 @@ def run_command(command, timeout=None):
     SANDBOX_AGENT_SAFETY=false). Denied commands are never executed;
     risky ones ask the human first. With SANDBOX_AGENT_DRY_RUN=true,
     nothing executes — the call just reports what would have run.
+
+    Web runs: when web_mode is set, an "approve"-verdict command raises
+    ApprovalNeeded instead of prompting on stdin; the agent loop pauses
+    for the web approval dialog. _approved=True (private kwarg, never in
+    the tool schema, so the LLM can never set it) skips the gate — the
+    agent loop passes it only after the user approved.
     """
     timeout = config.TIMEOUT if timeout is None else timeout
 
@@ -69,8 +100,11 @@ def run_command(command, timeout=None):
         verdict, reason = safety.classify(command)
         if verdict == "deny":
             return f"ERROR: blocked by safety policy: {reason}"
-        if verdict == "approve" and not safety.ask_approval(command, reason):
-            return "ERROR: command cancelled by user."
+        if verdict == "approve" and not _approved:
+            if web_mode.get():
+                raise ApprovalNeeded(command, reason)  # web: loop pauses for dialog
+            if not safety.ask_approval(command, reason):  # CLI: unchanged stdin prompt
+                return "ERROR: command cancelled by user."
 
     if config.SANDBOX_ENABLED:
         try:
@@ -142,6 +176,39 @@ TOOLS = {
     "fetch_url": fetch_url,
     "web_search": web_search,
 }
+
+
+def all_schemas():
+    """All tool schemas: built-ins plus MCP tools when mcp_tools exists.
+
+    mcp_tools.py is created by a separate worker; its absence is normal
+    and must not break anything — the lazy import is wrapped so a missing
+    (or broken) module just yields the built-in schemas.
+    """
+    schemas = list(TOOL_SCHEMAS)
+    try:
+        from mcp_tools import mcp_schemas
+
+        schemas.extend(mcp_schemas())
+    except Exception:
+        pass
+    return schemas
+
+
+def call_tool(name, args):
+    """Dispatch one tool call by name; return the result string.
+
+    Falls back to MCP tools (mcp_tools.call_mcp_tool) for names not in
+    TOOLS; unknown names become an ERROR string, never an exception.
+    """
+    fn = TOOLS.get(name)
+    if fn is not None:
+        return fn(**args)
+    try:
+        from mcp_tools import call_mcp_tool
+    except ImportError:
+        return f"ERROR: unknown tool '{name}'"
+    return call_mcp_tool(name, args)
 
 
 def _schema(name, description, properties, required):
