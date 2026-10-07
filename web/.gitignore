@@ -8,7 +8,8 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# NOTE: `dist` is intentionally NOT ignored — the prebuilt dashboard is committed
+# so that `uvicorn server:app` serves the UI straight from a fresh clone.
 dist-ssr
 *.local
 
