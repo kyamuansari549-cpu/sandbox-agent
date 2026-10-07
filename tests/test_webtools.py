@@ -179,16 +179,31 @@ def test_web_search_respects_num_results(monkeypatch):
 
 def test_web_search_empty_results(monkeypatch):
     _mock_post(monkeypatch, _FakeResp("<html><body><div>nothing here</div></body></html>"))
+
+    class _FakeJsonResp(_FakeResp):
+        def json(self):
+            return {"AbstractText": "", "RelatedTopics": []}
+
+    _mock_get(monkeypatch, _FakeJsonResp())
     out = webtools_mod.web_search("zzz unlikely query zzz")
     assert "no results found" in out
     assert not out.startswith("ERROR:")
 
 
 def test_web_search_bot_check_page(monkeypatch):
+    # Primary HTML endpoint serves a bot-check page -> falls back to the
+    # instant-answer API. Mock both: fallback returns nothing useful here,
+    # so we still get an ERROR.
     _mock_post(monkeypatch, _FakeResp(
         '<html><body><div class="anomaly-modal__mask">'
         '<form class="challenge-form"></form></div></body></html>'
     ))
+
+    class _FakeJsonResp(_FakeResp):
+        def json(self):
+            return {"AbstractText": "", "RelatedTopics": []}
+
+    _mock_get(monkeypatch, _FakeJsonResp())
     out = webtools_mod.web_search("anything")
     assert out.startswith("ERROR:")
     assert "bot-check" in out
@@ -198,6 +213,7 @@ def test_web_search_request_failure(monkeypatch):
     def _boom(*a, **k):
         raise requests.exceptions.ConnectionError("offline")
     _mock_post(monkeypatch, _boom)
+    _mock_get(monkeypatch, _boom)  # fallback also offline
     out = webtools_mod.web_search("anything")
     assert out.startswith("ERROR:")
 
@@ -205,6 +221,62 @@ def test_web_search_request_failure(monkeypatch):
 def test_web_search_empty_query():
     out = webtools_mod.web_search("   ")
     assert out.startswith("ERROR:")
+
+
+# --------------------------------------------------------------------------
+# web_search fallback (instant-answer API when HTML endpoint is blocked)
+
+
+class _FakeJsonResp(_FakeResp):
+    def __init__(self, payload, status_code=200):
+        super().__init__(text="", status_code=status_code)
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+_SAMPLE_JSON = {
+    "Heading": "Horror fiction",
+    "AbstractText": "Horror is a genre of speculative fiction...",
+    "AbstractURL": "https://en.wikipedia.org/wiki/Horror_fiction",
+    "RelatedTopics": [
+        {"FirstURL": "https://example.com/gothic",
+         "Text": "Gothic fiction – a genre combining horror and romance"},
+        {"FirstURL": "https://example.com/king",
+         "Text": "Stephen King – American horror author"},
+    ],
+}
+
+
+def test_web_search_falls_back_on_http_202(monkeypatch):
+    # Primary blocked with 202 -> instant-answer fallback serves results.
+    _mock_post(monkeypatch, _FakeResp("", status_code=202))
+    _mock_get(monkeypatch, _FakeJsonResp(_SAMPLE_JSON))
+    out = webtools_mod.web_search("horror story", num_results=5)
+    assert not out.startswith("ERROR:")
+    assert "Horror fiction" in out
+    assert "https://en.wikipedia.org/wiki/Horror_fiction" in out
+    assert "Stephen King" in out
+    assert "rate-limited" in out  # honesty note appended
+
+
+def test_web_search_fallback_respects_num_results(monkeypatch):
+    _mock_post(monkeypatch, _FakeResp("", status_code=202))
+    _mock_get(monkeypatch, _FakeJsonResp(_SAMPLE_JSON))
+    out = webtools_mod.web_search("horror story", num_results=1)
+    assert "1. Horror fiction" in out
+    assert "2." not in out
+
+
+def test_web_search_fallback_bad_json(monkeypatch):
+    _mock_post(monkeypatch, _FakeResp("", status_code=202))
+    _mock_get(monkeypatch, _FakeJsonResp(ValueError("no json")))
+    out = webtools_mod.web_search("anything")
+    assert out.startswith("ERROR:")
+    assert "fallback" in out
 
 
 # --------------------------------------------------------------------------

@@ -21,6 +21,11 @@ import config
 # DuckDuckGo's plain-HTML endpoint: no API key, no JS, easy to parse.
 _DDG_URL = "https://html.duckduckgo.com/html/"
 
+# Fallback when the HTML endpoint bot-blocks us: DuckDuckGo's instant-answer
+# JSON API. Only returns instant answers + related topics (no full web
+# results), but it is rarely rate-limited.
+_DDG_JSON_URL = "https://api.duckduckgo.com/"
+
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -160,20 +165,23 @@ class _DDGParser(HTMLParser):
         return href
 
 
-def web_search(query, num_results=5):
-    """Search the web (DuckDuckGo, no API key) and return numbered results.
+def _format_results(results):
+    """Numbered 'title / url / snippet' text from a list of result dicts."""
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. {r.get('title') or '(no title)'}")
+        lines.append(f"   {r.get('url') or '(no url)'}")
+        if r.get("snippet"):
+            lines.append(f"   {r['snippet']}")
+    return "\n".join(lines)
 
-    Each result: title, URL, snippet. Returns a clear message when nothing
-    is found, and "ERROR: ..." on request failure.
+
+def _ddg_html_search(query, num_results):
+    """Primary search via DuckDuckGo's HTML endpoint.
+
+    Returns (results, error): results is a list of dicts (may be empty),
+    error is None on success or an "ERROR: ..." string.
     """
-    query = (query or "").strip()
-    if not query:
-        return "ERROR: empty search query."
-    try:
-        num_results = max(1, min(int(num_results), 10))
-    except (TypeError, ValueError):
-        num_results = 5
-
     try:
         # NOTE: this endpoint expects a POST with form-encoded data.
         # A GET request is answered with a bot-challenge page (HTTP 202)
@@ -185,36 +193,119 @@ def web_search(query, num_results=5):
             headers={"User-Agent": _BROWSER_UA},
         )
     except requests.exceptions.Timeout:
-        return f"ERROR: web search timed out after {_FETCH_TIMEOUT}s."
+        return [], f"ERROR: web search timed out after {_FETCH_TIMEOUT}s."
     except requests.exceptions.RequestException as exc:
-        return f"ERROR: web search failed: {exc}"
+        return [], f"ERROR: web search failed: {exc}"
     except Exception as exc:  # never crash the agent loop
-        return f"ERROR: web search failed: {exc}"
+        return [], f"ERROR: web search failed: {exc}"
 
     if resp.status_code != 200:
-        return f"ERROR: search returned HTTP {resp.status_code}."
+        return [], f"ERROR: search returned HTTP {resp.status_code}."
 
     if "anomaly-modal" in resp.text or "challenge-form" in resp.text:
-        return (
+        return [], (
             "ERROR: DuckDuckGo served a bot-check page instead of search results "
-            "(automated requests are being rate-limited). Wait a minute and try again."
+            "(automated requests are being rate-limited)."
         )
 
     try:
         parser = _DDGParser()
         parser.feed(resp.text)
     except Exception as exc:
-        return f"ERROR: could not parse search results: {exc}"
+        return [], f"ERROR: could not parse search results: {exc}"
 
     results = [r for r in parser.results if r.get("title") or r.get("url")]
-    results = results[:num_results]
-    if not results:
-        return f"(no results found for: {query})"
+    return results[:num_results], None
 
-    lines = []
-    for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {r.get('title') or '(no title)'}")
-        lines.append(f"   {r.get('url') or '(no url)'}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet']}")
-    return "\n".join(lines)
+
+def _ddg_instant_search(query, num_results):
+    """Fallback search via DuckDuckGo's instant-answer JSON API.
+
+    Only yields instant answers + related topics (not full web results),
+    but it is far less aggressively rate-limited. Same (results, error)
+    return convention as _ddg_html_search.
+    """
+    try:
+        resp = requests.get(
+            _DDG_JSON_URL,
+            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            timeout=_FETCH_TIMEOUT,
+            headers={"User-Agent": _BROWSER_UA},
+        )
+    except requests.exceptions.Timeout:
+        return [], f"ERROR: fallback search timed out after {_FETCH_TIMEOUT}s."
+    except requests.exceptions.RequestException as exc:
+        return [], f"ERROR: fallback search failed: {exc}"
+    except Exception as exc:  # never crash the agent loop
+        return [], f"ERROR: fallback search failed: {exc}"
+
+    if resp.status_code != 200:
+        return [], f"ERROR: fallback search returned HTTP {resp.status_code}."
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        return [], f"ERROR: fallback search returned bad JSON: {exc}"
+
+    results = []
+    # Instant answer (abstract), when present.
+    if data.get("AbstractText") and data.get("AbstractURL"):
+        results.append({
+            "title": (data.get("Heading") or "Instant answer").strip(),
+            "url": data["AbstractURL"],
+            "snippet": data["AbstractText"].strip()[:400],
+        })
+    # Related topics.
+    for topic in data.get("RelatedTopics") or []:
+        if not isinstance(topic, dict):
+            continue  # grouped topics nest lists; skip them
+        url, text = topic.get("FirstURL"), topic.get("Text")
+        if url and text:
+            title = text.split("–")[0].split("-")[0].strip()[:100] or "Related topic"
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": text.strip()[:400],
+            })
+        if len(results) >= num_results:
+            break
+    return results[:num_results], None
+
+
+def web_search(query, num_results=5):
+    """Search the web (DuckDuckGo, no API key) and return numbered results.
+
+    Each result: title, URL, snippet. Returns a clear message when nothing
+    is found, and "ERROR: ..." on request failure.
+
+    If the primary HTML endpoint bot-blocks the request, automatically falls
+    back to DuckDuckGo's instant-answer API so the user still gets something
+    useful instead of a bare error.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "ERROR: empty search query."
+    try:
+        num_results = max(1, min(int(num_results), 10))
+    except (TypeError, ValueError):
+        num_results = 5
+
+    results, error = _ddg_html_search(query, num_results)
+    if results:
+        return _format_results(results)
+
+    # Primary failed or was blocked — try the instant-answer fallback.
+    fb_results, fb_error = _ddg_instant_search(query, num_results)
+    if fb_results:
+        return _format_results(fb_results) + (
+            "\n(note: quick answers — full web search was rate-limited, "
+            "try again in a minute for complete results)"
+        )
+
+    # Both failed: report the primary error (most informative), unless the
+    # primary simply found nothing and the fallback errored.
+    if error and "no results" not in error.lower():
+        return error + " (fallback search also failed)"
+    if fb_error:
+        return fb_error
+    return f"(no results found for: {query})"
