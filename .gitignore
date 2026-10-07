@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+
+# Runtime artifacts (created automatically, never commit)
+logs/
+work/
+
+# Frontend (source is committed; build output is committed too so that
+# `uvicorn server:app` works straight from a clone — but never node_modules)
+web/node_modules/
+
+# OS / editor
+.DS_Store
