@@ -65,9 +65,16 @@ def _coerce_args(args):
     if isinstance(args, str):
         try:
             return json.loads(args)
-        except json.JSONDecodeError:
+        except JSONDecodeError:
             return {}
     return args or {}
+
+
+# Model names for which Ollama's streaming responses came back empty
+# (no content AND no tool_calls) — a known quirk in some Ollama versions
+# where stream:true drops tool calls. Once seen, we skip streaming for
+# that model and use a single non-streaming call instead.
+_stream_broken = set()
 
 
 def _chat_with_tokens(messages, model):
@@ -77,7 +84,17 @@ def _chat_with_tokens(messages, model):
     while this generator drains the chunk queue, yielding
     {"type": "token", "content": chunk} events. A sentinel marks the end;
     any exception raised by the worker is re-raised here after draining.
+
+    Streaming fallback: some Ollama versions drop the whole response
+    (no content AND no tool_calls) when stream:true is combined with
+    tools. If that happens we retry ONCE with streaming off and remember
+    the model in _stream_broken so later turns skip streaming entirely.
     """
+    model_name = model or config.MODEL
+    if model_name in _stream_broken:
+        # Known-broken combo: one non-streaming call, no token events.
+        return llm.chat(messages, tools.all_schemas(), model=model)
+
     chunk_q = queue.Queue()
     outcome = {}
     _done = object()
@@ -105,7 +122,12 @@ def _chat_with_tokens(messages, model):
     thread.join()
     if "error" in outcome:
         raise outcome["error"]
-    return outcome["message"]
+    message = outcome["message"]
+    if not message.get("content") and not message.get("tool_calls"):
+        # Streaming dropped the response — retry once without streaming.
+        _stream_broken.add(model_name)
+        return llm.chat(messages, tools.all_schemas(), model=model)
+    return message
 
 
 def stream_agent(task, messages, model=None, run_id=None, cancel=None, approver=None):

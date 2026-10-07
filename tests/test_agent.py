@@ -269,3 +269,61 @@ def test_model_kwarg_reaches_llm_chat(monkeypatch):
     monkeypatch.setattr(llm_mod, "chat", fake_chat)
     list(agent_mod.stream_agent("hi", [], model="llama3.1:8b"))
     assert seen["model"] == "llama3.1:8b"
+
+
+def test_streaming_fallback_when_stream_drops_response(monkeypatch):
+    """If streaming returns empty (Ollama quirk), retry once without streaming."""
+
+    calls = []
+    tool_call_given = []
+
+    def fake_chat(messages, tools, **kw):
+        calls.append(kw.get("on_token") is not None)
+        if kw.get("on_token") is not None:
+            # Simulate the Ollama streaming quirk: empty message back.
+            return {"role": "assistant", "content": ""}
+        if not tool_call_given:
+            # Non-streaming retry: proper tool call (only once).
+            tool_call_given.append(True)
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "list_dir", "arguments": {"path": "."}}}
+                ],
+            }
+        # Next turn: final answer, loop ends.
+        return {"role": "assistant", "content": "done"}
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    monkeypatch.setattr(tools_mod, "call_tool", lambda name, args: "file1.txt")
+    agent_mod._stream_broken.clear()
+    try:
+        events = list(agent_mod.stream_agent("list files", []))
+    finally:
+        agent_mod._stream_broken.clear()
+
+    assert calls == [True, False, False]  # streamed, retried w/o stream, then 2nd turn skips streaming
+    tool_calls = [e for e in events if e["type"] == "tool_call"]
+    assert len(tool_calls) == 1 and tool_calls[0]["name"] == "list_dir"
+    assert events[-1] == {"type": "answer", "content": "done"}
+
+
+def test_streaming_skipped_after_quirk_seen(monkeypatch):
+    """Once a model is flagged, later turns skip streaming entirely."""
+
+    calls = []
+
+    def fake_chat(messages, tools, **kw):
+        calls.append(kw.get("on_token") is not None)
+        return {"role": "assistant", "content": "done"}
+
+    monkeypatch.setattr(llm_mod, "chat", fake_chat)
+    agent_mod._stream_broken.clear()
+    try:
+        agent_mod._stream_broken.add("quirky-model")
+        list(agent_mod.stream_agent("hi", [], model="quirky-model"))
+    finally:
+        agent_mod._stream_broken.clear()
+
+    assert calls == [False]  # no streaming attempted
