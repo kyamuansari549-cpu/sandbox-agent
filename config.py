@@ -90,15 +90,15 @@ LLM_CHAIN = [
 _CLOUD_PROVIDER_SPECS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "llama-3.3-70b-versatile",
+        "default_model": "openai/gpt-oss-120b",
     },
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "default_model": "gemini-2.0-flash",
+        "default_model": "gemini-3.6-flash",
     },
     "nvidia": {
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "default_model": "meta/llama-3.3-70b-instruct",
+        "default_model": "nvidia/nemotron-3-super-120b-a12b",
     },
 }
 

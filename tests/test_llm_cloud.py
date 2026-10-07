@@ -81,7 +81,7 @@ def test_cloud_chain_builds_ordered_entries(monkeypatch):
     assert [e["provider"] for e in chain] == ["groq", "gemini"]
     assert chain[0]["base_url"] == "https://api.groq.com/openai/v1"
     assert chain[0]["api_key"] == "gsk_test1"
-    assert chain[0]["model"] == "llama-3.3-70b-versatile"  # default
+    assert chain[0]["model"] == "openai/gpt-oss-120b"  # default
     assert "generativelanguage" in chain[1]["base_url"]
 
 
