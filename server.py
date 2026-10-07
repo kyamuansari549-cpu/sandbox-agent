@@ -437,11 +437,24 @@ def download_file(path: str):
 
 @app.get("/api/models")
 def list_models():
-    """Models available in Ollama, plus the configured default.
+    """Models available for the picker, plus the configured default.
 
-    Proxies Ollama's /api/tags; on ANY failure (Ollama down, bad JSON,
-    ...) returns an empty list with the default still set.
+    Cloud mode (LLM_PROVIDER=cloud): lists the configured fallback chain
+    as "provider:model" entries (deduplicated, chain order). Picking one
+    pins the chain to that provider/model; the default (first entry)
+    walks the whole chain with automatic failover.
+    Ollama mode: proxies Ollama's /api/tags; on ANY failure (Ollama down,
+    bad JSON, ...) returns an empty list with the default still set.
     """
+    if config.LLM_PROVIDER == "cloud":
+        seen = set()
+        models = []
+        for entry in config.cloud_chain():
+            label = f"{entry['provider']}:{entry['model']}"
+            if label not in seen:
+                seen.add(label)
+                models.append(label)
+        return {"models": models, "default": models[0] if models else ""}
     try:
         resp = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=5)
         resp.raise_for_status()
