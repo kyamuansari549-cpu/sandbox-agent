@@ -1,4 +1,4 @@
-# SandboxAgent 🤖
+# SandboxAgent
 
 **Your own mini AI agent with a computer.** You give it a task in plain
 English — like "summarize these files" or "look up the latest Python release
